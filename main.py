@@ -9,6 +9,9 @@ from dataclasses import dataclass, asdict
 import hashlib
 
 import google.generativeai as genai
+import google.auth
+from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -36,7 +39,9 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # ключ от Google AI Studio
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+VERTEX_API_KEY = os.getenv("VERTEX_API_KEY")  # ключ от Vertex AI
+USE_VERTEX = os.getenv("USE_VERTEX", "false").lower() == "true"  # флаг для переключения
 MAX_SEARCH_RESULTS = 10
 
 # Пути к файлам
@@ -61,8 +66,8 @@ class Modpack:
     title: str
     description: str
     minecraft_version: str
-    image_url: Optional[str]          # иконка (запасной вариант)
-    gallery_urls: List[str]            # скриншоты из галереи
+    image_url: Optional[str]
+    gallery_urls: List[str]
     download_url: str
     platform: str
     categories: List[str]
@@ -108,7 +113,6 @@ class ModpackFinder:
         return pack_id in self.posted_packs
     
     def get_project_gallery(self, project_id: str) -> List[str]:
-        """Получает список URL скриншотов из галереи"""
         try:
             r = requests.get(
                 f"{self.modrinth_api}/project/{project_id}/gallery",
@@ -117,7 +121,6 @@ class ModpackFinder:
             )
             r.raise_for_status()
             data = r.json()
-            # Берём первые 3 скриншота
             return [item['url'] for item in data[:3]]
         except Exception as e:
             logger.debug(f"Не удалось получить галерею для {project_id}: {e}")
@@ -125,7 +128,6 @@ class ModpackFinder:
     
     async def search_new_modpacks(self) -> List[Modpack]:
         new_packs = []
-        # Используем упрощённый синтаксис facets
         facets = '[["project_type:modpack"]]'
         params = {
             "query": "",
@@ -152,12 +154,10 @@ class ModpackFinder:
                 if self.is_pack_posted(unique_id):
                     continue
                 
-                # Получаем детальную информацию
                 project = self.get_modrinth_project(pack_id)
                 if not project:
                     continue
                 
-                # Получаем версии
                 versions = self.get_modrinth_versions(pack_id)
                 mc_versions = set()
                 loaders = set()
@@ -167,7 +167,6 @@ class ModpackFinder:
                     for loader in ver.get("loaders", []):
                         loaders.add(loader)
                 
-                # Получаем галерею
                 gallery = self.get_project_gallery(pack_id)
                 
                 modpack = Modpack(
@@ -212,11 +211,21 @@ class ModpackFinder:
         except:
             return []
 
-# Класс для генерации текста через нейросеть (Gemini)
+# Класс для генерации текста через нейросеть (Gemini + Vertex AI)
 class NeuralStyler:
-    def __init__(self, api_key: str):
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-3-flash-preview')  # бесплатная модель
+    def __init__(self, api_key: str, use_vertex: bool = False):
+        self.use_vertex = use_vertex
+        if use_vertex:
+            # Настройка для Vertex AI (указываем регион)
+            import vertexai
+            vertexai.init(project=os.getenv("GCP_PROJECT_ID"), location="us-central1")
+            from vertexai.generative_models import GenerativeModel
+            self.model = GenerativeModel("gemini-1.5-pro")
+        else:
+            # Обычная настройка Gemini API
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
+        
         self.prompt_template = """
 Ты — копирайтер, который пишет посты для Telegram-канала про сборки Minecraft.
 Стиль поста должен быть таким (используй эмодзи, структуру с заголовками, хештеги):
@@ -274,7 +283,6 @@ class NeuralStyler:
 """
     
     async def generate_post(self, modpack: Modpack) -> str:
-        """Генерирует пост с помощью нейросети"""
         prompt = self.prompt_template.format(
             title=modpack.title,
             mc_version=modpack.minecraft_version,
@@ -284,18 +292,22 @@ class NeuralStyler:
             platform=modpack.platform
         )
         try:
-            response = self.model.generate_content(prompt)
-            return response.text
+            if self.use_vertex:
+                # Vertex AI требует синхронного вызова в отдельном потоке
+                import asyncio
+                response = await asyncio.to_thread(self.model.generate_content, prompt)
+                return response.text
+            else:
+                response = self.model.generate_content(prompt)
+                return response.text
         except Exception as e:
-            logger.error(f"Ошибка при генерации через Gemini: {e}")
-            # Возвращаем заглушку (используем старый стилизатор как fallback)
+            logger.error(f"Ошибка при генерации через нейросеть: {e}")
             return FallbackStyler.style_message(modpack)
 
-# Запасной стилизатор (если нейросеть недоступна)
+# Запасной стилизатор
 class FallbackStyler:
     @staticmethod
     def style_message(modpack: Modpack) -> str:
-        # Простая стилизация на основе категорий (минимум)
         title_emoji = "📦"
         cat = modpack.categories
         if "magic" in cat:
@@ -373,7 +385,6 @@ class PostQueue:
         return due
 
 def get_next_schedule_time() -> float:
-    """Возвращает timestamp ближайшего слота (12:00 или 18:00)"""
     now = datetime.now()
     slot12 = now.replace(hour=12, minute=0, second=0, microsecond=0)
     slot18 = now.replace(hour=18, minute=0, second=0, microsecond=0)
@@ -387,7 +398,6 @@ def get_next_schedule_time() -> float:
         return tomorrow.replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
 
 def download_image(url: str, pack_id: str) -> Optional[str]:
-    """Скачивает изображение и возвращает локальный путь"""
     if not url:
         return None
     try:
@@ -435,10 +445,14 @@ class UserSession:
 
 # Глобальные объекты
 finder = ModpackFinder()
-if GEMINI_API_KEY:
-    neural_styler = NeuralStyler(GEMINI_API_KEY)
+if USE_VERTEX and VERTEX_API_KEY:
+    neural_styler = NeuralStyler(VERTEX_API_KEY, use_vertex=True)
+    logger.info("Используется Vertex AI")
+elif GEMINI_API_KEY:
+    neural_styler = NeuralStyler(GEMINI_API_KEY, use_vertex=False)
+    logger.info("Используется Gemini API")
 else:
-    logger.warning("GEMINI_API_KEY не задан, будет использован fallback-стилизатор")
+    logger.warning("Ключ API не задан, будет использован fallback-стилизатор")
     neural_styler = None
 
 user_sessions: Dict[int, UserSession] = {}
@@ -449,7 +463,6 @@ def get_user_session(user_id: int) -> UserSession:
     return user_sessions[user_id]
 
 async def generate_post_text(modpack: Modpack) -> str:
-    """Генерирует текст поста (нейросетью или fallback)"""
     if neural_styler:
         try:
             return await neural_styler.generate_post(modpack)
@@ -458,7 +471,6 @@ async def generate_post_text(modpack: Modpack) -> str:
     return FallbackStyler.style_message(modpack)
 
 async def send_modpack_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, modpack: Modpack):
-    """Отправляет предпросмотр сборки с кнопками"""
     text = await generate_post_text(modpack)
     
     keyboard = [
@@ -475,7 +487,6 @@ async def send_modpack_preview(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Пытаемся взять первый скриншот из галереи, если есть
     image_url = modpack.gallery_urls[0] if modpack.gallery_urls else modpack.image_url
     
     if image_url:
@@ -492,7 +503,6 @@ async def send_modpack_preview(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as e:
             logger.error(f"Ошибка загрузки изображения: {e}")
     
-    # Если нет картинки или ошибка, отправляем текстом
     await update.effective_chat.send_message(
         text=text,
         parse_mode=ParseMode.MARKDOWN,
@@ -553,12 +563,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = query.data
     
     if action == "publish":
-        # Добавляем в очередь
         text = await generate_post_text(pack)
         scheduled_time = get_next_schedule_time()
         dt_str = datetime.fromtimestamp(scheduled_time).strftime("%d.%m %H:%M")
         
-        # Скачиваем картинку (первый скриншот или иконку)
         image_url = pack.gallery_urls[0] if pack.gallery_urls else pack.image_url
         image_path = download_image(image_url, pack.get_id()) if image_url else None
         
@@ -571,18 +579,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title=pack.title
         )
         PostQueue.add_post(queued)
-        
-        # Помечаем как обработанную
         finder.save_posted_pack(pack.get_id())
         
-        # Удаляем сообщение с предпросмотром и отправляем подтверждение новым сообщением
         await query.message.delete()
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"✅ Сборка добавлена в очередь на {dt_str}"
         )
         
-        # Переходим к следующей
         if session.has_next():
             session.next()
             await send_modpack_preview(update, context, session.current_pack)
@@ -593,7 +597,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     
     elif action == "publish_now":
-        # Мгновенная публикация в канал (для теста)
         text = await generate_post_text(pack)
         image_url = pack.gallery_urls[0] if pack.gallery_urls else pack.image_url
         
@@ -659,7 +662,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     
     elif action == "regenerate":
-        # Перегенерируем текст и обновляем сообщение
         await query.message.delete()
         await send_modpack_preview(update, context, pack)
     
@@ -680,7 +682,6 @@ async def edit_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Ошибка. Начни заново.")
         return ConversationHandler.END
     
-    # Добавляем в очередь с пользовательским текстом
     scheduled_time = get_next_schedule_time()
     dt_str = datetime.fromtimestamp(scheduled_time).strftime("%d.%m %H:%M")
     
@@ -700,7 +701,6 @@ async def edit_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     await update.message.reply_text(f"✅ Сборка добавлена в очередь на {dt_str}")
     
-    # Переходим к следующей
     user_id = update.effective_user.id
     session = get_user_session(user_id)
     if session.has_next():
@@ -719,7 +719,6 @@ async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_modpack_preview(update, context, session.current_pack)
     return ConversationHandler.END
 
-# Периодическая проверка очереди
 async def check_queue_callback(context: ContextTypes.DEFAULT_TYPE):
     now = time.time()
     due_posts = PostQueue.get_due_posts(now)
@@ -741,7 +740,6 @@ async def check_queue_callback(context: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=reply_markup
                     )
-                # Удаляем файл после отправки
                 os.remove(post.image_path)
             else:
                 await context.bot.send_message(
@@ -756,7 +754,6 @@ async def check_queue_callback(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Ошибка публикации из очереди: {e}")
 
-# Обработка ошибок
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
@@ -767,18 +764,13 @@ def main():
     if not CHANNEL_ID:
         logger.error("CHANNEL_ID не задан")
         return
-    if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY не задан, будет использован fallback-стилизатор (менее качественный)")
     
-    # Создаём приложение
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Регистрируем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("search", search))
     app.add_handler(CommandHandler("queue", queue_command))
     
-    # ConversationHandler для редактирования
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_callback, pattern="^edit$")],
         states={
@@ -788,10 +780,8 @@ def main():
     )
     app.add_handler(conv_handler)
     
-    # Обработчик всех остальных callback
     app.add_handler(CallbackQueryHandler(button_callback))
     
-    # Периодическая проверка очереди (раз в минуту)
     job_queue = app.job_queue
     job_queue.run_repeating(check_queue_callback, interval=60, first=10)
     
@@ -802,4 +792,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
