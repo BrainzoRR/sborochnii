@@ -259,14 +259,14 @@ class MessageStyler:
 class PostQueue:
     @staticmethod
     def load() -> List[QueuedPost]:
-        if not os.path.exists(QUEUE_FILE):
+        # Если файл не существует или пуст, возвращаем пустой список
+        if not os.path.exists(QUEUE_FILE) or os.path.getsize(QUEUE_FILE) == 0:
             return []
         try:
             with open(QUEUE_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                # Преобразуем dict в QueuedPost
                 return [QueuedPost(**item) for item in data]
-        except Exception as e:
+        except (json.JSONDecodeError, Exception) as e:
             logger.error(f"Ошибка загрузки очереди: {e}")
             return []
     
@@ -676,4 +676,5 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
+
     main()
