@@ -82,7 +82,7 @@ class ModpackFinder:
     
     def __init__(self):
         self.modrinth_api = "https://api.modrinth.com/v2"
-        self.headers = {"User-Agent": "MyModpackBot/1.0 (contact@example.com)"}
+        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         self.posted_packs = self.load_posted_packs()
     
     def load_posted_packs(self) -> set:
@@ -104,11 +104,11 @@ class ModpackFinder:
         new_packs = []
     
         # Формируем facets как JSON-строку
-        facets = json.dumps([[{"field": "project_type", "value": "modpack"}]])
+        facets = '[["project_type:modpack"]]'
     
         params = {
             "query": "",
-            "facets": facets,
+            "facets": '[["project_type:modpack"]]',
             "sort": "updated",
             "limit": 50
         }
@@ -682,4 +682,5 @@ def main():
 if __name__ == "__main__":
 
     main()
+
 
