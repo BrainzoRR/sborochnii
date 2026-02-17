@@ -216,7 +216,7 @@ class ModpackFinder:
 class NeuralStyler:
     def __init__(self, api_key: str):
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')  # бесплатная модель
+        self.model = genai.GenerativeModel('gemini-3-flash-preview')  # бесплатная модель
         self.prompt_template = """
 Ты — копирайтер, который пишет посты для Telegram-канала про сборки Minecraft.
 Стиль поста должен быть таким (используй эмодзи, структуру с заголовками, хештеги):
@@ -802,3 +802,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
