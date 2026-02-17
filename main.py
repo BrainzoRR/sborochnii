@@ -101,15 +101,18 @@ class ModpackFinder:
         return pack_id in self.posted_packs
     
     async def search_new_modpacks(self) -> List[Modpack]:
-        """Поиск новых сборок на Modrinth, которые ещё не публиковались"""
         new_packs = []
+    
+        # Формируем facets как JSON-строку
+        facets = json.dumps([[{"field": "project_type", "value": "modpack"}]])
+    
         params = {
             "query": "",
-            "facets": [[{"field": "project_type", "value": "modpack"}]],
+            "facets": facets,
             "sort": "updated",
             "limit": 50
         }
-        
+    
         try:
             response = requests.get(
                 f"{self.modrinth_api}/search",
@@ -119,6 +122,7 @@ class ModpackFinder:
             )
             response.raise_for_status()
             data = response.json()
+        # ... остальной код без изменений ...
             
             for hit in data.get("hits", []):
                 pack_id = hit["project_id"]
@@ -678,3 +682,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
