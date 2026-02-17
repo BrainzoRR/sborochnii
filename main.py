@@ -2,12 +2,13 @@ import os
 import logging
 import json
 import time
-import shutil
 import requests
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from dataclasses import dataclass, asdict
 import hashlib
+
+import google.generativeai as genai
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # ключ от Google AI Studio
 MAX_SEARCH_RESULTS = 10
 
 # Пути к файлам
@@ -210,98 +212,122 @@ class ModpackFinder:
         except:
             return []
 
-class MessageStyler:
-    """Стилизация сообщений в уникальном формате"""
+# Класс для генерации текста через нейросеть (Gemini)
+class NeuralStyler:
+    def __init__(self, api_key: str):
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel('gemini-1.5-flash')  # бесплатная модель
+        self.prompt_template = """
+Ты — копирайтер, который пишет посты для Telegram-канала про сборки Minecraft.
+Стиль поста должен быть таким (используй эмодзи, структуру с заголовками, хештеги):
+
+Пример 1:
+**Isle of Berk (1.18.2)** 🐉
+
+Полное погружение в вселенную «Как приручить дракона». Летай, приручай и сражайся верхом на драконах, исследуй мир викингов.
+
+🐉 Драконы
+• Более 50 видов и 1000+ вариаций
+• Приручение, разведение и полёты
+• От малышей до гигантских особей
+
+⚔️ Данжи и битвы
+• Многоуровневые подземелья
+• Сражения плечом к плечу с драконами
+
+#синглплеер #приключение
+
+❤️ - Заходит
+👎 - Не моё
+
+Пример 2:
+**Ascendra (1.20.1)** 🔮
+
+Большое магическое приключение, где магия встречается с технологиями. Сборка для тех, кто любит долгий прогресс и квесты.
+
+🔮 Магия и технологии
+• 440+ модов в одной связке
+• Уникальная прогрессия
+• Глубокие квестовые линейки
+
+👑 Эпичные боссы
+• Полностью новые, сложные битвы
+• Боссы, которые заставят попотеть
+
+#синглплеер #квесты #магия
+
+❤️ - Заходит
+👎 - Не моё
+
+Теперь создай пост в таком же стиле для следующей сборки.
+Данные:
+Название: {title}
+Версия Minecraft: {mc_version}
+Описание: {description}
+Категории: {categories}
+Загрузчики: {loaders}
+Платформа: {platform}
+
+Пост должен быть на русском языке, используй эмодзи, списки, хештеги. В конце обязательно строки:
+❤️ - Заходит
+👎 - Не моё
+"""
     
+    async def generate_post(self, modpack: Modpack) -> str:
+        """Генерирует пост с помощью нейросети"""
+        prompt = self.prompt_template.format(
+            title=modpack.title,
+            mc_version=modpack.minecraft_version,
+            description=modpack.description,
+            categories=", ".join(modpack.categories),
+            loaders=", ".join(modpack.loaders),
+            platform=modpack.platform
+        )
+        try:
+            response = self.model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            logger.error(f"Ошибка при генерации через Gemini: {e}")
+            # Возвращаем заглушку (используем старый стилизатор как fallback)
+            return FallbackStyler.style_message(modpack)
+
+# Запасной стилизатор (если нейросеть недоступна)
+class FallbackStyler:
     @staticmethod
     def style_message(modpack: Modpack) -> str:
-        # Определяем эмодзи для заголовка по категориям
-        cat = modpack.categories
-        desc_lower = modpack.description.lower()
-        
-        # Эмодзи для заголовка
+        # Простая стилизация на основе категорий (минимум)
         title_emoji = "📦"
-        if "magic" in cat or "магия" in desc_lower:
+        cat = modpack.categories
+        if "magic" in cat:
             title_emoji = "🔮"
-        elif "adventure" in cat or "приключ" in desc_lower:
+        elif "adventure" in cat:
             title_emoji = "⚔️"
-        elif "technology" in cat or "техн" in desc_lower:
-            title_emoji = "⚙️"
-        elif "exploration" in cat or "исслед" in desc_lower:
-            title_emoji = "🌍"
-        elif "dragon" in desc_lower or "дракон" in desc_lower:
-            title_emoji = "🐉"
-        elif "viking" in desc_lower or "викинг" in desc_lower:
-            title_emoji = "🛡️"
         
-        # Основное описание (первые 300 символов, обрезаем по предложению)
-        short_desc = modpack.description[:300].rsplit('.', 1)[0] + "."
+        desc = modpack.description[:200].rsplit(' ', 1)[0] + "..."
         
-        # Формируем особенности
         features = []
         if "magic" in cat:
-            features.append("🔮 Магия и заклинания")
+            features.append("🔮 Магия")
         if "adventure" in cat:
-            features.append("⚔️ Приключения и данжи")
-        if "technology" in cat:
-            features.append("⚙️ Технологии и механизмы")
-        if "exploration" in cat:
-            features.append("🌍 Исследование миров")
-        if "quests" in cat:
-            features.append("📜 Квесты")
-        if "building" in cat:
-            features.append("🏗️ Строительство")
-        
-        # Если особенностей мало, добавляем из описания
-        if len(features) < 3:
-            if "dragon" in desc_lower:
-                features.append("🐉 Драконы")
-            if "viking" in desc_lower:
-                features.append("🛡️ Викинги")
-            if "optimiz" in desc_lower:
-                features.append("⚡ Оптимизация")
-        
-        # Добиваем до 3-4 пунктов общими фразами
-        while len(features) < 3:
+            features.append("⚔️ Приключения")
+        if not features:
             features.append("✨ Уникальные механики")
         
-        # Хештеги
-        tags = ["#майнкрафт", "#сборка"]
-        if modpack.platform == "modrinth":
-            tags.append("#modrinth")
+        tags = ["#майнкрафт", "#сборка", f"#mc{modpack.minecraft_version[:4].replace('.','')}"]
         
-        # Добавляем хештеги из категорий
-        cat_map = {
-            "adventure": "#приключение",
-            "magic": "#магия",
-            "technology": "#техно",
-            "exploration": "#исследование",
-            "quests": "#квесты",
-            "building": "#строительство"
-        }
-        for c in cat:
-            if c in cat_map and cat_map[c] not in tags:
-                tags.append(cat_map[c])
-        
-        # Хештег с версией (без точек)
-        ver = modpack.minecraft_version.split(',')[0].strip().replace('.', '')
-        tags.append(f"#mc{ver}")
-        
-        # Собираем пост
         lines = [
             f"**{modpack.title} ({modpack.minecraft_version})** {title_emoji}",
             "",
-            short_desc,
+            desc,
             "",
             "✨ **Особенности:**"
         ]
-        lines.extend([f"• {f}" for f in features[:4]])
+        lines.extend([f"• {f}" for f in features])
         lines.append("")
         lines.append(" ".join(tags))
         lines.append("")
         lines.append("❤️ - Заходит")
         lines.append("👎 - Не моё")
-        
         return "\n".join(lines)
 
 # Работа с очередью
@@ -331,15 +357,6 @@ class PostQueue:
         queue = PostQueue.load()
         queue.append(post)
         PostQueue.save(queue)
-    
-    @staticmethod
-    def remove_post(index: int) -> Optional[QueuedPost]:
-        queue = PostQueue.load()
-        if 0 <= index < len(queue):
-            removed = queue.pop(index)
-            PostQueue.save(queue)
-            return removed
-        return None
     
     @staticmethod
     def get_due_posts(now: float) -> List[QueuedPost]:
@@ -418,7 +435,12 @@ class UserSession:
 
 # Глобальные объекты
 finder = ModpackFinder()
-styler = MessageStyler()
+if GEMINI_API_KEY:
+    neural_styler = NeuralStyler(GEMINI_API_KEY)
+else:
+    logger.warning("GEMINI_API_KEY не задан, будет использован fallback-стилизатор")
+    neural_styler = None
+
 user_sessions: Dict[int, UserSession] = {}
 
 def get_user_session(user_id: int) -> UserSession:
@@ -426,9 +448,18 @@ def get_user_session(user_id: int) -> UserSession:
         user_sessions[user_id] = UserSession()
     return user_sessions[user_id]
 
+async def generate_post_text(modpack: Modpack) -> str:
+    """Генерирует текст поста (нейросетью или fallback)"""
+    if neural_styler:
+        try:
+            return await neural_styler.generate_post(modpack)
+        except Exception as e:
+            logger.error(f"Ошибка генерации нейросетью: {e}")
+    return FallbackStyler.style_message(modpack)
+
 async def send_modpack_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, modpack: Modpack):
     """Отправляет предпросмотр сборки с кнопками"""
-    text = styler.style_message(modpack)
+    text = await generate_post_text(modpack)
     
     keyboard = [
         [
@@ -523,7 +554,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if action == "publish":
         # Добавляем в очередь
-        text = styler.style_message(pack)
+        text = await generate_post_text(pack)
         scheduled_time = get_next_schedule_time()
         dt_str = datetime.fromtimestamp(scheduled_time).strftime("%d.%m %H:%M")
         
@@ -563,7 +594,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif action == "publish_now":
         # Мгновенная публикация в канал (для теста)
-        text = styler.style_message(pack)
+        text = await generate_post_text(pack)
         image_url = pack.gallery_urls[0] if pack.gallery_urls else pack.image_url
         
         keyboard = [[InlineKeyboardButton("📥 Скачать сборку", url=pack.download_url)]]
@@ -628,7 +659,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     
     elif action == "regenerate":
-        # Удаляем старое и отправляем новое (текст может измениться при следующей стилизации)
+        # Перегенерируем текст и обновляем сообщение
         await query.message.delete()
         await send_modpack_preview(update, context, pack)
     
@@ -736,6 +767,8 @@ def main():
     if not CHANNEL_ID:
         logger.error("CHANNEL_ID не задан")
         return
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY не задан, будет использован fallback-стилизатор (менее качественный)")
     
     # Создаём приложение
     app = Application.builder().token(TELEGRAM_TOKEN).build()
