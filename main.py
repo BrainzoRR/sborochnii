@@ -6,8 +6,7 @@ import shutil
 import requests
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-from dataclasses import dataclass, asdict, field
-from enum import Enum
+from dataclasses import dataclass, asdict
 import hashlib
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -35,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")          # например: @my_channel или -1001234567890
+CHANNEL_ID = os.getenv("CHANNEL_ID")
 MAX_SEARCH_RESULTS = 10
 
 # Пути к файлам
@@ -43,8 +42,13 @@ QUEUE_FILE = "queue.json"
 POSTED_PACKS_FILE = "posted_packs.txt"
 IMAGES_DIR = "images"
 
-# Создаём папку для изображений, если её нет
+# Создаём папку для изображений
 os.makedirs(IMAGES_DIR, exist_ok=True)
+
+# Создаём пустой queue.json, если его нет
+if not os.path.exists(QUEUE_FILE) or os.path.getsize(QUEUE_FILE) == 0:
+    with open(QUEUE_FILE, 'w', encoding='utf-8') as f:
+        json.dump([], f)
 
 # Состояния для ConversationHandler
 EDITING_TEXT = 1
@@ -55,7 +59,8 @@ class Modpack:
     title: str
     description: str
     minecraft_version: str
-    image_url: Optional[str]
+    image_url: Optional[str]          # иконка (запасной вариант)
+    gallery_urls: List[str]            # скриншоты из галереи
     download_url: str
     platform: str
     categories: List[str]
@@ -71,11 +76,11 @@ class Modpack:
 @dataclass
 class QueuedPost:
     text: str
-    image_path: Optional[str]          # локальный путь к скачанной картинке
+    image_path: Optional[str]
     download_url: str
-    scheduled_time: float               # timestamp публикации
-    pack_id: str                        # идентификатор сборки
-    title: str                          # для логов
+    scheduled_time: float
+    pack_id: str
+    title: str
 
 class ModpackFinder:
     """Поиск сборок на Modrinth"""
@@ -100,19 +105,33 @@ class ModpackFinder:
     def is_pack_posted(self, pack_id: str) -> bool:
         return pack_id in self.posted_packs
     
+    def get_project_gallery(self, project_id: str) -> List[str]:
+        """Получает список URL скриншотов из галереи"""
+        try:
+            r = requests.get(
+                f"{self.modrinth_api}/project/{project_id}/gallery",
+                headers=self.headers,
+                timeout=30
+            )
+            r.raise_for_status()
+            data = r.json()
+            # Берём первые 3 скриншота
+            return [item['url'] for item in data[:3]]
+        except Exception as e:
+            logger.debug(f"Не удалось получить галерею для {project_id}: {e}")
+            return []
+    
     async def search_new_modpacks(self) -> List[Modpack]:
         new_packs = []
-    
-        # Формируем facets как JSON-строку
+        # Используем упрощённый синтаксис facets
         facets = '[["project_type:modpack"]]'
-    
         params = {
             "query": "",
-            "facets": '[["project_type:modpack"]]',
+            "facets": facets,
             "sort": "updated",
             "limit": 50
         }
-    
+        
         try:
             response = requests.get(
                 f"{self.modrinth_api}/search",
@@ -122,7 +141,6 @@ class ModpackFinder:
             )
             response.raise_for_status()
             data = response.json()
-        # ... остальной код без изменений ...
             
             for hit in data.get("hits", []):
                 pack_id = hit["project_id"]
@@ -132,10 +150,12 @@ class ModpackFinder:
                 if self.is_pack_posted(unique_id):
                     continue
                 
+                # Получаем детальную информацию
                 project = self.get_modrinth_project(pack_id)
                 if not project:
                     continue
                 
+                # Получаем версии
                 versions = self.get_modrinth_versions(pack_id)
                 mc_versions = set()
                 loaders = set()
@@ -145,11 +165,15 @@ class ModpackFinder:
                     for loader in ver.get("loaders", []):
                         loaders.add(loader)
                 
+                # Получаем галерею
+                gallery = self.get_project_gallery(pack_id)
+                
                 modpack = Modpack(
                     title=hit["title"],
                     description=hit.get("description", ""),
                     minecraft_version=", ".join(sorted(mc_versions, reverse=True)[:3]),
                     image_url=hit.get("icon_url"),
+                    gallery_urls=gallery,
                     download_url=f"https://modrinth.com/modpack/{slug}",
                     platform="modrinth",
                     categories=hit.get("categories", []),
@@ -187,71 +211,92 @@ class ModpackFinder:
             return []
 
 class MessageStyler:
-    """Стилизация сообщений"""
+    """Стилизация сообщений в уникальном формате"""
     
     @staticmethod
     def style_message(modpack: Modpack) -> str:
-        desc = modpack.description.lower()
+        # Определяем эмодзи для заголовка по категориям
+        cat = modpack.categories
+        desc_lower = modpack.description.lower()
         
-        # Выбор эмодзи
-        category_emojis = {
-            "adventure": "⚔️", "magic": "🔮", "technology": "⚙️",
-            "exploration": "🌍", "quests": "📜", "building": "🏗️",
-            "dragon": "🐉", "viking": "🛡️", "fantasy": "🧝"
-        }
-        main_emoji = "📦"
-        for cat, emoji in category_emojis.items():
-            if cat in desc or any(cat in c for c in modpack.categories):
-                main_emoji = emoji
-                break
+        # Эмодзи для заголовка
+        title_emoji = "📦"
+        if "magic" in cat or "магия" in desc_lower:
+            title_emoji = "🔮"
+        elif "adventure" in cat or "приключ" in desc_lower:
+            title_emoji = "⚔️"
+        elif "technology" in cat or "техн" in desc_lower:
+            title_emoji = "⚙️"
+        elif "exploration" in cat or "исслед" in desc_lower:
+            title_emoji = "🌍"
+        elif "dragon" in desc_lower or "дракон" in desc_lower:
+            title_emoji = "🐉"
+        elif "viking" in desc_lower or "викинг" in desc_lower:
+            title_emoji = "🛡️"
         
-        lines = [
-            f"**{modpack.title} ({modpack.minecraft_version})** {main_emoji}",
-            "",
-            ". ".join(modpack.description.split('. ')[:3]) + ".",
-            "",
-            "✨ **Особенности:**"
-        ]
+        # Основное описание (первые 300 символов, обрезаем по предложению)
+        short_desc = modpack.description[:300].rsplit('.', 1)[0] + "."
         
+        # Формируем особенности
         features = []
-        if "magic" in modpack.categories:
-            features.append("• Магические заклинания и артефакты")
-        if "technology" in modpack.categories:
-            features.append("• Продвинутые механизмы и автоматизация")
-        if "adventure" in modpack.categories:
-            features.append("• Захватывающие приключения и подземелья")
-        if "exploration" in modpack.categories:
-            features.append("• Бескрайние миры для исследования")
-        if "quests" in modpack.categories:
-            features.append("• Глубокая квестовая линия")
-        if "dragon" in desc or "dragon" in str(modpack.categories):
-            features.append("• Полеты и сражения верхом на драконах")
+        if "magic" in cat:
+            features.append("🔮 Магия и заклинания")
+        if "adventure" in cat:
+            features.append("⚔️ Приключения и данжи")
+        if "technology" in cat:
+            features.append("⚙️ Технологии и механизмы")
+        if "exploration" in cat:
+            features.append("🌍 Исследование миров")
+        if "quests" in cat:
+            features.append("📜 Квесты")
+        if "building" in cat:
+            features.append("🏗️ Строительство")
         
-        if modpack.loaders:
-            loaders_str = ", ".join(modpack.loaders).upper()
-            features.append(f"• Загрузчик: {loaders_str}")
+        # Если особенностей мало, добавляем из описания
+        if len(features) < 3:
+            if "dragon" in desc_lower:
+                features.append("🐉 Драконы")
+            if "viking" in desc_lower:
+                features.append("🛡️ Викинги")
+            if "optimiz" in desc_lower:
+                features.append("⚡ Оптимизация")
         
+        # Добиваем до 3-4 пунктов общими фразами
         while len(features) < 3:
-            features.append("• Множество новых мобов и предметов")
-        
-        lines.extend(features[:4])
-        lines.append("")
+            features.append("✨ Уникальные механики")
         
         # Хештеги
         tags = ["#майнкрафт", "#сборка"]
         if modpack.platform == "modrinth":
             tags.append("#modrinth")
         
+        # Добавляем хештеги из категорий
         cat_map = {
-            "adventure": "#приключение", "magic": "#магия", "technology": "#техно",
-            "quests": "#квесты", "exploration": "#исследование", "building": "#строительство"
+            "adventure": "#приключение",
+            "magic": "#магия",
+            "technology": "#техно",
+            "exploration": "#исследование",
+            "quests": "#квесты",
+            "building": "#строительство"
         }
-        for cat in modpack.categories:
-            if cat in cat_map and cat_map[cat] not in tags:
-                tags.append(cat_map[cat])
+        for c in cat:
+            if c in cat_map and cat_map[c] not in tags:
+                tags.append(cat_map[c])
         
-        ver = modpack.minecraft_version.split(',')[0].strip()[:4]
+        # Хештег с версией (без точек)
+        ver = modpack.minecraft_version.split(',')[0].strip().replace('.', '')
         tags.append(f"#mc{ver}")
+        
+        # Собираем пост
+        lines = [
+            f"**{modpack.title} ({modpack.minecraft_version})** {title_emoji}",
+            "",
+            short_desc,
+            "",
+            "✨ **Особенности:**"
+        ]
+        lines.extend([f"• {f}" for f in features[:4]])
+        lines.append("")
         lines.append(" ".join(tags))
         lines.append("")
         lines.append("❤️ - Заходит")
@@ -263,7 +308,6 @@ class MessageStyler:
 class PostQueue:
     @staticmethod
     def load() -> List[QueuedPost]:
-        # Если файл не существует или пуст, возвращаем пустой список
         if not os.path.exists(QUEUE_FILE) or os.path.getsize(QUEUE_FILE) == 0:
             return []
         try:
@@ -299,7 +343,6 @@ class PostQueue:
     
     @staticmethod
     def get_due_posts(now: float) -> List[QueuedPost]:
-        """Возвращает посты, время которых <= now, и удаляет их из очереди"""
         queue = PostQueue.load()
         due = []
         remaining = []
@@ -313,9 +356,8 @@ class PostQueue:
         return due
 
 def get_next_schedule_time() -> float:
-    """Возвращает timestamp ближайшего слота публикации (12:00 или 18:00)"""
+    """Возвращает timestamp ближайшего слота (12:00 или 18:00)"""
     now = datetime.now()
-    # Сегодняшние слоты
     slot12 = now.replace(hour=12, minute=0, second=0, microsecond=0)
     slot18 = now.replace(hour=18, minute=0, second=0, microsecond=0)
     
@@ -324,7 +366,6 @@ def get_next_schedule_time() -> float:
     elif now < slot18:
         return slot18.timestamp()
     else:
-        # завтра 12:00
         tomorrow = now + timedelta(days=1)
         return tomorrow.replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
 
@@ -335,7 +376,6 @@ def download_image(url: str, pack_id: str) -> Optional[str]:
     try:
         response = requests.get(url, timeout=30)
         if response.status_code == 200:
-            # Генерируем имя файла на основе pack_id
             ext = os.path.splitext(url.split('?')[0])[1]
             if not ext or len(ext) > 5:
                 ext = '.png'
@@ -386,58 +426,47 @@ def get_user_session(user_id: int) -> UserSession:
         user_sessions[user_id] = UserSession()
     return user_sessions[user_id]
 
-async def send_modpack_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, modpack: Modpack, edit: bool = False):
-    """Отправляет или редактирует предпросмотр сборки с кнопками"""
+async def send_modpack_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, modpack: Modpack):
+    """Отправляет предпросмотр сборки с кнопками"""
     text = styler.style_message(modpack)
     
     keyboard = [
         [
             InlineKeyboardButton("📦 В очередь", callback_data="publish"),
-            InlineKeyboardButton("✏️ Редактировать", callback_data="edit")
+            InlineKeyboardButton("🚀 Опубликовать сейчас", callback_data="publish_now")
         ],
         [
+            InlineKeyboardButton("✏️ Редактировать", callback_data="edit"),
             InlineKeyboardButton("🔄 Перегенерировать", callback_data="regenerate"),
             InlineKeyboardButton("❌ Отклонить", callback_data="reject")
-        ]
+        ],
+        [InlineKeyboardButton("📥 Скачать сборку", url=modpack.download_url)]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    if modpack.image_url:
+    # Пытаемся взять первый скриншот из галереи, если есть
+    image_url = modpack.gallery_urls[0] if modpack.gallery_urls else modpack.image_url
+    
+    if image_url:
         try:
-            img_response = requests.get(modpack.image_url, timeout=30)
+            img_response = requests.get(image_url, timeout=30)
             if img_response.status_code == 200:
-                if edit:
-                    await update.effective_chat.send_photo(
-                        photo=img_response.content,
-                        caption=text,
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=reply_markup
-                    )
-                    await update.callback_query.message.delete()
-                else:
-                    await update.effective_chat.send_photo(
-                        photo=img_response.content,
-                        caption=text,
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=reply_markup
-                    )
+                await update.effective_chat.send_photo(
+                    photo=img_response.content,
+                    caption=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup
+                )
                 return
         except Exception as e:
             logger.error(f"Ошибка загрузки изображения: {e}")
     
-    # Если нет картинки или ошибка
-    if edit:
-        await update.callback_query.edit_message_text(
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup
-        )
-    else:
-        await update.effective_chat.send_message(
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup
-        )
+    # Если нет картинки или ошибка, отправляем текстом
+    await update.effective_chat.send_message(
+        text=text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
 
 # Обработчики команд
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -465,7 +494,6 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_modpack_preview(update, context, session.current_pack)
 
 async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает содержимое очереди"""
     queue = PostQueue.load()
     if not queue:
         await update.message.reply_text("📭 Очередь пуста.")
@@ -499,10 +527,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scheduled_time = get_next_schedule_time()
         dt_str = datetime.fromtimestamp(scheduled_time).strftime("%d.%m %H:%M")
         
-        # Скачиваем картинку
-        image_path = None
-        if pack.image_url:
-            image_path = download_image(pack.image_url, pack.get_id())
+        # Скачиваем картинку (первый скриншот или иконку)
+        image_url = pack.gallery_urls[0] if pack.gallery_urls else pack.image_url
+        image_path = download_image(image_url, pack.get_id()) if image_url else None
         
         queued = QueuedPost(
             text=text,
@@ -514,28 +541,94 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         PostQueue.add_post(queued)
         
-        # Помечаем как обработанную (чтобы не показывать снова)
+        # Помечаем как обработанную
         finder.save_posted_pack(pack.get_id())
         
-        await query.edit_message_text(f"✅ Сборка добавлена в очередь на {dt_str}")
+        # Удаляем сообщение с предпросмотром и отправляем подтверждение новым сообщением
+        await query.message.delete()
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ Сборка добавлена в очередь на {dt_str}"
+        )
         
         # Переходим к следующей
         if session.has_next():
             session.next()
             await send_modpack_preview(update, context, session.current_pack)
         else:
-            await query.message.reply_text("Все новые сборки закончились. Используй /search снова.")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Все новые сборки закончились. Используй /search снова."
+            )
+    
+    elif action == "publish_now":
+        # Мгновенная публикация в канал (для теста)
+        text = styler.style_message(pack)
+        image_url = pack.gallery_urls[0] if pack.gallery_urls else pack.image_url
+        
+        keyboard = [[InlineKeyboardButton("📥 Скачать сборку", url=pack.download_url)]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        try:
+            if image_url:
+                img_response = requests.get(image_url, timeout=30)
+                if img_response.status_code == 200:
+                    await context.bot.send_photo(
+                        chat_id=CHANNEL_ID,
+                        photo=img_response.content,
+                        caption=text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=reply_markup
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=reply_markup
+                    )
+            else:
+                await context.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup
+                )
+            
+            finder.save_posted_pack(pack.get_id())
+            
+            await query.message.delete()
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="🚀 Сборка опубликована в канал!"
+            )
+            
+            if session.has_next():
+                session.next()
+                await send_modpack_preview(update, context, session.current_pack)
+            else:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="Все новые сборки закончились. Используй /search снова."
+                )
+        except Exception as e:
+            logger.error(f"Ошибка публикации: {e}")
+            await query.edit_message_text(f"❌ Ошибка при публикации: {e}")
     
     elif action == "reject":
         finder.save_posted_pack(pack.get_id())
+        await query.message.delete()
         if session.has_next():
             session.next()
             await send_modpack_preview(update, context, session.current_pack)
         else:
-            await query.edit_message_text("Сборка отклонена. Новых больше нет.")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Сборка отклонена. Новых больше нет."
+            )
     
     elif action == "regenerate":
-        # Удаляем старое сообщение и отправляем новое (текст может измениться)
+        # Удаляем старое и отправляем новое (текст может измениться при следующей стилизации)
         await query.message.delete()
         await send_modpack_preview(update, context, pack)
     
@@ -560,9 +653,8 @@ async def edit_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE)
     scheduled_time = get_next_schedule_time()
     dt_str = datetime.fromtimestamp(scheduled_time).strftime("%d.%m %H:%M")
     
-    image_path = None
-    if pack.image_url:
-        image_path = download_image(pack.image_url, pack.get_id())
+    image_url = pack.gallery_urls[0] if pack.gallery_urls else pack.image_url
+    image_path = download_image(image_url, pack.get_id()) if image_url else None
     
     queued = QueuedPost(
         text=user_text,
@@ -598,7 +690,6 @@ async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Периодическая проверка очереди
 async def check_queue_callback(context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет, не пора ли отправить посты из очереди"""
     now = time.time()
     due_posts = PostQueue.get_due_posts(now)
     
@@ -619,6 +710,8 @@ async def check_queue_callback(context: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=reply_markup
                     )
+                # Удаляем файл после отправки
+                os.remove(post.image_path)
             else:
                 await context.bot.send_message(
                     chat_id=CHANNEL_ID,
@@ -628,14 +721,9 @@ async def check_queue_callback(context: ContextTypes.DEFAULT_TYPE):
                 )
             
             logger.info(f"Опубликована сборка из очереди: {post.title}")
-            
-            # Удаляем картинку после отправки (опционально)
-            if post.image_path and os.path.exists(post.image_path):
-                os.remove(post.image_path)
                 
         except Exception as e:
             logger.error(f"Ошибка публикации из очереди: {e}")
-            # В случае ошибки можно вернуть пост обратно в очередь? Пока просто логируем.
 
 # Обработка ошибок
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -667,7 +755,7 @@ def main():
     )
     app.add_handler(conv_handler)
     
-    # Обработчик всех остальных callback (publish, reject, regenerate)
+    # Обработчик всех остальных callback
     app.add_handler(CallbackQueryHandler(button_callback))
     
     # Периодическая проверка очереди (раз в минуту)
@@ -680,7 +768,4 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-
     main()
-
-
